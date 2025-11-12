@@ -32,8 +32,16 @@ def is_swanlab_available():
     return importlib.util.find_spec('swanlab') is not None
 
 
+def is_te_available():
+    return importlib.util.find_spec('transformer_engine') is not None
+
+
 def is_megatron_available():
     return importlib.util.find_spec('megatron') is not None
+
+
+def is_mindspeed_available():
+    return importlib.util.find_spec('mindspeed') is not None
 
 
 def is_flash_attn_3_available():

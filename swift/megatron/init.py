@@ -12,35 +12,37 @@ import peft
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from transformers.utils import is_torch_npu_available
 from packaging import version
 from tqdm import tqdm
 
 from swift.llm import git_clone_github
-from swift.utils import (get_logger, is_flash_attn_3_available, is_megatron_available, safe_ddp_context, split_list,
-                         subprocess_run)
+from swift.utils import (get_logger, is_flash_attn_3_available, is_te_available, is_megatron_available,
+                         is_mindspeed_available, safe_ddp_context, split_list, subprocess_run)
 
 logger = get_logger()
 
 
 def _patch_transformer_engine():
-    import transformer_engine
-    try:
-        from transformer_engine.pytorch.attention import apply_rotary_pos_emb
-    except ImportError:
+    if is_te_available():
+        import transformer_engine
         try:
-            transformer_engine.pytorch.attention.apply_rotary_pos_emb = (
-                transformer_engine.pytorch.attention.rope.apply_rotary_pos_emb)
-            logger.info('Patch apply_rotary_pos_emb successfully applied.')
-        except (ImportError, AttributeError):
-            pass
-    try:
-        from transformer_engine.pytorch.attention import _SplitAlongDim
-    except ImportError:
+            from transformer_engine.pytorch.attention import apply_rotary_pos_emb
+        except ImportError:
+            try:
+                transformer_engine.pytorch.attention.apply_rotary_pos_emb = (
+                    transformer_engine.pytorch.attention.rope.apply_rotary_pos_emb)
+                logger.info('Patch apply_rotary_pos_emb successfully applied.')
+            except (ImportError, AttributeError):
+                pass
         try:
-            transformer_engine.pytorch.attention._SplitAlongDim = (transformer_engine.pytorch.utils.SplitAlongDim)
-            logger.info('Patch _SplitAlongDim successfully applied.')
-        except (ImportError, AttributeError):
-            pass
+            from transformer_engine.pytorch.attention import _SplitAlongDim
+        except ImportError:
+            try:
+                transformer_engine.pytorch.attention._SplitAlongDim = (transformer_engine.pytorch.utils.SplitAlongDim)
+                logger.info('Patch _SplitAlongDim successfully applied.')
+            except (ImportError, AttributeError):
+                pass
 
 
 def _patch__batched_p2p_ops():
@@ -366,17 +368,18 @@ def _patch_peft_BaseTuner():
 
 
 def _patch_TEGroupedLinear():
-    from megatron.core.extensions.transformer_engine import TEGroupedLinear
+    if is_te_available():
+        from megatron.core.extensions.transformer_engine import TEGroupedLinear
 
-    def sharded_state_dict(
-            self,
-            prefix: str = '',
-            sharded_offsets: Tuple[Tuple[int, int, int]] = (),
-            metadata: Optional[dict] = None,
-    ):
-        return self._sharded_state_dict_grouped(None, prefix, sharded_offsets, metadata)
+        def sharded_state_dict(
+                self,
+                prefix: str = '',
+                sharded_offsets: Tuple[Tuple[int, int, int]] = (),
+                metadata: Optional[dict] = None,
+        ):
+            return self._sharded_state_dict_grouped(None, prefix, sharded_offsets, metadata)
 
-    TEGroupedLinear.sharded_state_dict = sharded_state_dict
+        TEGroupedLinear.sharded_state_dict = sharded_state_dict
 
 
 def _patch_megatron_tokenizer():
@@ -529,13 +532,14 @@ def _patch_validate_non_overlapping_shards_metadata():
 
 
 def _patch_TELinear():
-    from megatron.core.extensions.transformer_engine import TELinear
+    if is_te_available():
+        from megatron.core.extensions.transformer_engine import TELinear
 
-    def __repr__(self):
-        return (f'{type(self).__name__}(in_features={self.in_features}, '
-                f'out_features={self.out_features}, bias={self.use_bias}, TP={self.tp_size})')
+        def __repr__(self):
+            return (f'{type(self).__name__}(in_features={self.in_features}, '
+                    f'out_features={self.out_features}, bias={self.use_bias}, TP={self.tp_size})')
 
-    TELinear.__repr__ = __repr__
+        TELinear.__repr__ = __repr__
 
 
 def _patch_build_train_valid_test_datasets():
@@ -669,6 +673,22 @@ def _patch_mrope():
 
 
 def _patch_megatron():
+    if is_torch_npu_available():
+        try:
+            from mindspeed.megatron_adaptor import repatch
+        except ImportError:
+            repatch = None
+
+        override_transformer_config = {
+            "recompute_granularity": None,
+            "recompute_modules": ["core_attn"],
+            "recompute_method": None,
+            "recompute_num_layers": None,
+        }
+
+        if repatch is not None:
+            repatch(override_transformer_config)
+
     logging_level = logging.root.level
     _patch_flash_attn()
     _patch_transformer_engine()
@@ -708,10 +728,20 @@ def init_megatron_env() -> None:
     if 'MEGATRON_LM_PATH' not in os.environ:
         # TODO: Synchronization issues may occur in DDP scenarios
         # if the distributed environment has not been initialized.
+        if is_torch_npu_available():
+            megatron_branch = 'core_v0.12.1'
+            os.environ['MINDSPEED_PATH'] = git_clone_github(
+                'https://gitcode.com/nomiz/MindSpeed.git', branch='master', commit_hash='fbed864e')
+        else:
+            megatron_branch = 'core_r0.14.0'
         os.environ['MEGATRON_LM_PATH'] = git_clone_github(
-            'https://github.com/NVIDIA/Megatron-LM', branch='core_r0.14.0')
+            'https://github.com/NVIDIA/Megatron-LM', branch=megatron_branch)
     with safe_ddp_context(hash_id='megatron-lm'):
         if not is_megatron_available():
             subprocess_run([sys.executable, '-m', 'pip', 'install', '-e', os.environ['MEGATRON_LM_PATH']])
+        if is_torch_npu_available() and not is_mindspeed_available():
+            subprocess_run([sys.executable, '-m', 'pip', 'install', '-e', os.environ['MINDSPEED_PATH']])
     sys.path.insert(0, os.environ['MEGATRON_LM_PATH'])
+    if is_torch_npu_available():
+        sys.path.insert(0, os.environ['MINDSPEED_PATH'])
     _patch_megatron()
